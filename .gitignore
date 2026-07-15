@@ -1,0 +1,12 @@
+.venv*/
+models/
+results/
+vendor/
+tools/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.idea/
+.vscode/
+outputs/
+*.zip
