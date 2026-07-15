@@ -143,6 +143,38 @@ python extract_fine_hair.py `
 
 默认根据 Hair mask（缺失时根据 matte）计算外接框，并自动增加 `outer-radius + filter halo`，只在 crop 中运行中值滤波、梯度和形态学操作。最终 01 mask、alpha 和 score 均回填到原始完整分辨率且 ROI 外严格为 0；BOK blending 在 ROI 外保持原始 BOK。可用 `--no-roi` 关闭裁剪；`--roi-margin` 可设置外扩下限，但不会低于保证滤波等价性的安全值。
 
+## 将细发丝背景化
+
+`hair_bokeh.py` 使用最终细发丝 mask，把 BOK 中对应的发丝区域替换为邻近背景。默认不是直接中值滤波，而是：mask 轻微外扩以覆盖抗锯齿边缘 → Telea 重建原有 BOK 背景 → 对重建区域做轻微高斯虚化 → 在线性光空间羽化融合。由于背景样本直接来自 BOK，原图已有的散景颜色和模糊形态会被保留下来。
+
+```powershell
+python hair_bokeh.py `
+  --prefix D:\images\base\2p `
+  --fine-dir D:\results\2p\final `
+  --output D:\results\2p\hair-bokeh
+```
+
+也可以显式指定输入：
+
+```powershell
+python hair_bokeh.py `
+  --bok D:\images\2p_bok.png `
+  --mask D:\results\fine_hair_mask_01.png `
+  --alpha D:\results\fine_hair_alpha_16bit.png `
+  --output D:\results\hair-bokeh
+```
+
+主要输出：
+
+```text
+hair_bokeh.png                 完整分辨率主结果
+hair_bokeh_compare.jpg         BOK 与处理结果左右对比
+hair_bokeh_metadata.json       输入、ROI、参数与像素统计
+debug/00_* ～ 06_*             重建区域、融合权重和差值诊断图
+```
+
+`--method median` 可用于快速对照，但人物轮廓附近可能把主体颜色带入背景；`--method hybrid` 会给 Telea 结果混入少量中值结果。默认 `--method inpaint` 对 2p 样例最稳妥。残留亮边可提高 `--expand-radius` 到 3；边缘过软可把 `--feather-sigma` 降到 1.5；背景本身非常虚时可提高 `--background-blur-sigma`。
+
 ## 许可
 
 BiRefNet 为 MIT。Sapiens2 使用 Meta 的 Sapiens2 License；商用前必须自行确认上游许可条款。
