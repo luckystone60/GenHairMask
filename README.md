@@ -66,17 +66,82 @@ powershell -ExecutionPolicy Bypass -File .\run_sample.ps1 `
 位于 `results/2p/final/`：
 
 ```text
-fine_hair_mask.png             4K 二值细发丝 mask（主结果）
+fine_hair_mask_01.png          严格 0/1 的 uint8 细发丝 mask（主结果）
+fine_hair_mask.png             兼容普通看图软件的 0/255 二值 mask
 fine_hair_alpha_16bit.png      BiRefNet 原始覆盖率，仅保留最终细发丝
-fine_hair_score_16bit.png      融合置信度
-fine_hair_overlay.jpg          红色叠加验收图
+fine_hair_score_16bit.png      16-bit 融合置信度
+fine_hair_bok_blend.png        01 mask 与完整 BOK 的红色混合验收图
+fine_hair_overlay.jpg          JPEG 兼容预览
 validation_report.json         尺寸、位深、二值性自动检查
-debug_*.png                    各阶段诊断图
+debug/00_*.jpg、01_*.png...    按 `00_`～`17_` 处理步骤编号的 ROI 尺寸诊断图
 ```
 
-算法组合：Sapiens2 Hair 语义邻域 → 排除 Face/Apparel/Clothing 类边界 → BiRefNet alpha 边缘 → BOK 多尺度中值残差 → EDOF/BOK 清晰度负证据 → 双阈值连通 → 只保留约 12 像素 Hair 内侧边缘带 → 形态学宽结构剔除。
+算法组合：Sapiens2 Hair 语义邻域 → 排除 Face/Apparel/Clothing 类边界 → BiRefNet alpha 边缘 → BOK 多尺度中值残差 → EDOF/BOK 清晰度负证据 → 双阈值连通 → 只保留约 12 像素 Hair 内侧边缘带 → 形态学宽结构剔除 → 四方向高置信短缺口连接。
 
-默认参数已经针对 2p 样例调好。更保守可提高 `--low-score` / `--high-score`；漏发丝可增大 `--inner-band` 或 `--thin-radius`。`thin-radius` 越大，允许保留的发丝越粗。
+默认参数已经针对 2p 样例调好，优先改善长发丝被截断的问题。`thin-radius` 越大，允许保留的发丝越粗；`gap-close-radius` 控制水平、垂直和两个对角方向可连接的短缺口，新增像素仍必须落在已通过语义、alpha 和连接性验证的候选区内。
+
+需要恢复旧版更保守的输出时：
+
+```powershell
+python extract_fine_hair.py `
+  --prefix D:\images\base\2p `
+  --output D:\results\2p-conservative `
+  --thin-radius 6 `
+  --gap-close-radius 0
+```
+
+背景复杂时优先缩短桥接距离或提高桥接分数，不建议直接全局降低双阈值：
+
+```text
+--gap-close-radius 2 --gap-score-min 0.20
+```
+
+## 单图 prefix 模式
+
+只需给出公共路径前缀，脚本会自动寻找其余输入：
+
+```powershell
+python extract_fine_hair.py `
+  --prefix D:\images\base\2p `
+  --output D:\results\2p
+```
+
+至少需要：
+
+```text
+2p_bok.png
+2p_edof.png
+2p_biref_bok_mat4k.png    # 也兼容 2p_bok_mat4k.png
+```
+
+可选先验：
+
+```text
+2p_bok_hair.png
+2p_bok_hair_probability_16bit.png
+2p_bok_sapiens2_labels.png
+```
+
+若 Hair mask 缺失或为空，脚本会用 matte 缩小 ROI，并优先使用剩余的 Sapiens2 Hair 概率/标签；所有 Hair 先验都缺失时才把 matte 当作种子。此模式保证不中断，但只能检测人像轮廓附近的细线，误检风险高于正常 Hair 模式，具体后备来源会写入 `run_metadata.json`。
+
+旧版显式参数 `--bok --edof --hair --hair-probability --sapiens2-labels --matte` 仍可使用，其中 `--hair` 已变为可选。
+
+## 目录批处理
+
+批处理会扫描目录内所有 `<prefix>_bok` 图片，按 prefix 串行处理，并把结果分别写入独立子目录：
+
+```powershell
+python extract_fine_hair.py `
+  --input-dir D:\images\base `
+  --batch `
+  --output D:\results\fine-hair
+```
+
+汇总结果位于 `batch_summary.json`。缺 Hair mask 会自动 fallback；缺少 EDOF 或 matte 的样本会记录失败，但默认继续处理其他样本。加 `--fail-fast` 可在首个错误处停止。
+
+## ROI 加速
+
+默认根据 Hair mask（缺失时根据 matte）计算外接框，并自动增加 `outer-radius + filter halo`，只在 crop 中运行中值滤波、梯度和形态学操作。最终 01 mask、alpha 和 score 均回填到原始完整分辨率且 ROI 外严格为 0；BOK blending 在 ROI 外保持原始 BOK。可用 `--no-roi` 关闭裁剪；`--roi-margin` 可设置外扩下限，但不会低于保证滤波等价性的安全值。
 
 ## 许可
 

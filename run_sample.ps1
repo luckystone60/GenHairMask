@@ -31,7 +31,7 @@ if (-not (Test-Path -LiteralPath $Edof)) {
     throw "EDOF input missing: $Edof"
 }
 
-# When both model snapshots are already cached, prevent harmless Hub HEAD requests.
+# 两个模型快照都已缓存时，禁止无意义的 Hub HEAD 请求，确保可离线复现。
 $BiRefCache = Join-Path $Root "models\models--ZhengPeng7--BiRefNet_HR-matting\refs\main"
 $SapiensCache = Join-Path $Root "models\models--facebook--sapiens2-seg-0.4b\refs\main"
 if ((Test-Path -LiteralPath $BiRefCache) -and (Test-Path -LiteralPath $SapiensCache)) {
@@ -57,12 +57,7 @@ if ((Test-Path -LiteralPath $BiRefCache) -and (Test-Path -LiteralPath $SapiensCa
   --prefix $Prefix
 
 & $Python (Join-Path $Root "extract_fine_hair.py") `
-  --bok (Join-Path $Base "${Prefix}_bok.png") `
-  --edof (Join-Path $Base "${Prefix}_edof.png") `
-  --hair (Join-Path $Base "${Prefix}_bok_hair.png") `
-  --hair-probability (Join-Path $Base "${Prefix}_bok_hair_probability_16bit.png") `
-  --sapiens2-labels (Join-Path $Base "${Prefix}_bok_sapiens2_labels.png") `
-  --matte (Join-Path $Base "${Prefix}_bok_mat4k.png") `
+  --prefix (Join-Path $Base $Prefix) `
   --output $Fine
 
 & $Python (Join-Path $Root "validate_outputs.py") --base $Base --fine $Fine --prefix $Prefix
