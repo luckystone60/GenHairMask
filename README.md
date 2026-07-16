@@ -73,12 +73,23 @@ fine_hair_score_16bit.png      16-bit 融合置信度
 fine_hair_bok_blend.png        01 mask 与完整 BOK 的红色混合验收图
 fine_hair_overlay.jpg          JPEG 兼容预览
 validation_report.json         尺寸、位深、二值性自动检查
-debug/00_*.jpg、01_*.png...    按 `00_`～`17_` 处理步骤编号的 ROI 尺寸诊断图
+debug/00_*.jpg、01_*.png...    按 `00_`～`23_` 处理步骤编号的 ROI 尺寸诊断图
 ```
 
-算法组合：Sapiens2 Hair 语义邻域 → 排除 Face/Apparel/Clothing 类边界 → BiRefNet alpha 边缘 → BOK 多尺度中值残差 → EDOF/BOK 清晰度负证据 → 双阈值连通 → 只保留约 12 像素 Hair 内侧边缘带 → 形态学宽结构剔除 → 四方向高置信短缺口连接。
+算法组合：Sapiens2 Hair 语义邻域 → 排除 Face/Apparel/Clothing 类边界 → BiRefNet alpha 边缘 → BOK 多尺度中值残差 → EDOF/BOK 清晰度负证据 → 双阈值连通 → 只保留约 12 像素 Hair 内侧边缘带 → 形态学宽结构剔除 → 四方向高置信短缺口连接 → 颜色和细长结构约束的有限区域生长。
 
-默认参数已经针对 2p 样例调好，优先改善长发丝被截断的问题。`thin-radius` 越大，允许保留的发丝越粗；`gap-close-radius` 控制水平、垂直和两个对角方向可连接的短缺口，新增像素仍必须落在已通过语义、alpha 和连接性验证的候选区内。
+默认参数已经针对 2p 样例调好，优先改善长发丝被截断的问题。`thin-radius` 越大，允许保留的发丝越粗；`gap-close-radius` 控制水平、垂直和两个对角方向可连接的短缺口。区域生长把生长前已确认的发丝作为固定颜色锚点，要求新增像素同时满足 Lab 近似色、局部方向一致、细线响应、搜索范围和 EDOF/BOK 负证据约束，并逐轮抑制宽块形成，不会把新增像素继续当作颜色基准而产生漂移。
+
+区域生长提供四档参数：
+
+```powershell
+--growth-preset off             # 完全关闭，逐像素复现上一版结果
+--growth-preset conservative    # 背景复杂、优先精度
+--growth-preset balanced        # 默认，召回/精度平衡
+--growth-preset recall          # 发丝漏检较多、优先召回
+```
+
+在 2p 样例上，`balanced` 从生长前的 36,444 像素增加到 42,074（+15.4%）；`recall` 增加到 48,644（+33.5%）。高召回档适合批量结果仍明显漏发丝时使用，但背景中存在与头发同色的细长结构时，应检查 blending 和 `debug/21_region_growth_added.png`。如需细调，可覆盖 `--growth-radius`、`--growth-color-delta`、`--growth-line-min` 和 `--growth-coherence-min` 等高级参数；显式参数优先于预设。
 
 需要恢复旧版更保守的输出时：
 
@@ -87,7 +98,8 @@ python extract_fine_hair.py `
   --prefix D:\images\base\2p `
   --output D:\results\2p-conservative `
   --thin-radius 6 `
-  --gap-close-radius 0
+  --gap-close-radius 0 `
+  --growth-preset off
 ```
 
 背景复杂时优先缩短桥接距离或提高桥接分数，不建议直接全局降低双阈值：

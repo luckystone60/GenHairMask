@@ -16,6 +16,58 @@ MEDIAN_KERNELS = (7, 11, 17, 25, 35)
 REFERENCE_AREA = 2509 * 3760
 HAIR_CLASS_ID = 4
 
+# 区域生长预设。高级参数仍可逐项覆盖，便于在不同数据集上做精度/召回权衡。
+GROWTH_PRESETS = {
+    "off": {
+        "growth_radius": 0,
+        "growth_color_delta": 18.0,
+        "growth_line_min": 0.055,
+        "growth_score_min": 0.035,
+        "growth_alpha_min": 0.001,
+        "growth_blur_max": 0.38,
+        "growth_coherence_min": 0.25,
+        "growth_width_radius": 3,
+        "growth_max_neighbors": 5,
+        "growth_alpha_scale": 0.85,
+    },
+    "conservative": {
+        "growth_radius": 18,
+        "growth_color_delta": 13.0,
+        "growth_line_min": 0.075,
+        "growth_score_min": 0.055,
+        "growth_alpha_min": 0.003,
+        "growth_blur_max": 0.35,
+        "growth_coherence_min": 0.35,
+        "growth_width_radius": 3,
+        "growth_max_neighbors": 4,
+        "growth_alpha_scale": 0.80,
+    },
+    "balanced": {
+        "growth_radius": 32,
+        "growth_color_delta": 18.0,
+        "growth_line_min": 0.055,
+        "growth_score_min": 0.035,
+        "growth_alpha_min": 0.001,
+        "growth_blur_max": 0.38,
+        "growth_coherence_min": 0.25,
+        "growth_width_radius": 3,
+        "growth_max_neighbors": 5,
+        "growth_alpha_scale": 0.85,
+    },
+    "recall": {
+        "growth_radius": 48,
+        "growth_color_delta": 23.0,
+        "growth_line_min": 0.040,
+        "growth_score_min": 0.020,
+        "growth_alpha_min": 0.0005,
+        "growth_blur_max": 0.42,
+        "growth_coherence_min": 0.18,
+        "growth_width_radius": 4,
+        "growth_max_neighbors": 5,
+        "growth_alpha_scale": 0.90,
+    },
+}
+
 # 同时兼容 prepare_base_images.py 的规范命名和 run_pipeline.py 的原始命名。
 ROLE_SUFFIXES = {
     "bok": ("_bok",),
@@ -239,6 +291,244 @@ def bridge_directional_gaps(
     ) & (blur_loss <= blur_max)
     bridge = closed & ~mask & allowed_region & evidence
     return mask | bridge, bridge
+
+
+def line_coherence_map(bgr: np.ndarray, window_size: int = 7) -> np.ndarray:
+    """用结构张量计算局部方向一致性，细长结构趋近 1，散乱纹理趋近 0。"""
+
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
+    gradient_x = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+    gradient_y = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+    kernel_size = (window_size, window_size)
+    tensor_xx = cv2.boxFilter(
+        gradient_x * gradient_x,
+        cv2.CV_32F,
+        kernel_size,
+        normalize=True,
+    )
+    tensor_yy = cv2.boxFilter(
+        gradient_y * gradient_y,
+        cv2.CV_32F,
+        kernel_size,
+        normalize=True,
+    )
+    tensor_xy = cv2.boxFilter(
+        gradient_x * gradient_y,
+        cv2.CV_32F,
+        kernel_size,
+        normalize=True,
+    )
+    numerator = np.sqrt(
+        np.maximum(
+            (tensor_xx - tensor_yy) ** 2 + 4.0 * tensor_xy * tensor_xy,
+            0.0,
+        )
+    )
+    return np.clip(numerator / (tensor_xx + tensor_yy + 1e-6), 0.0, 1.0)
+
+
+def nearest_seed_features(
+    bgr: np.ndarray,
+    seed: np.ndarray,
+    seed_alpha: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """计算到最近确定发丝的距离、Lab 色差和可传播 alpha。"""
+
+    if not seed.any():
+        shape = seed.shape
+        return (
+            np.full(shape, np.inf, np.float32),
+            np.full(shape, np.inf, np.float32),
+            np.zeros(shape, np.float32),
+        )
+
+    lab_u8 = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+    lab = np.empty_like(lab_u8)
+    lab[..., 0] = lab_u8[..., 0] * (100.0 / 255.0)
+    lab[..., 1:] = lab_u8[..., 1:] - 128.0
+
+    # DIST_LABEL_PIXEL 为每个确定发丝像素分配独立标签，可直接建立最近种子查找表。
+    distance, nearest_labels = cv2.distanceTransformWithLabels(
+        (~seed).astype(np.uint8),
+        cv2.DIST_L2,
+        5,
+        labelType=cv2.DIST_LABEL_PIXEL,
+    )
+    maximum_label = int(nearest_labels.max(initial=0))
+    color_lookup = np.zeros((maximum_label + 1, 3), np.float32)
+    alpha_lookup = np.zeros(maximum_label + 1, np.float32)
+    seed_labels = nearest_labels[seed]
+    color_lookup[seed_labels] = lab[seed]
+    alpha_lookup[seed_labels] = seed_alpha[seed]
+    nearest_color = color_lookup[nearest_labels]
+    color_delta = np.sqrt(np.sum((lab - nearest_color) ** 2, axis=2))
+    nearest_alpha = alpha_lookup[nearest_labels]
+    return distance, color_delta, nearest_alpha
+
+
+def grow_thin_connected_region(
+    seed: np.ndarray,
+    allowed: np.ndarray,
+    max_steps: int,
+    width_radius: int,
+    max_neighbors: int,
+) -> np.ndarray:
+    """从确定发丝逐像素生长，同时阻止横向变宽和大块区域灌入。"""
+
+    if max_steps <= 0 or not seed.any() or not allowed.any():
+        return seed.copy()
+
+    grown = seed.copy()
+    neighbor_kernel = np.ones((3, 3), np.uint8)
+    for _ in range(max_steps):
+        neighbor_count = cv2.filter2D(
+            grown.astype(np.uint8),
+            cv2.CV_16U,
+            neighbor_kernel,
+        )
+        proposal = (
+            cv2.dilate(grown.astype(np.uint8), neighbor_kernel).astype(bool)
+            & allowed
+            & ~grown
+            & (neighbor_count <= max_neighbors)
+        )
+        if not proposal.any():
+            break
+
+        # 如果新区域能通过较大椭圆开运算，它更可能是块状轮廓而不是细长发丝。
+        trial = grown | proposal
+        broad = cv2.morphologyEx(
+            trial.astype(np.uint8),
+            cv2.MORPH_OPEN,
+            ellipse(width_radius),
+        ).astype(bool)
+        proposal &= ~broad
+        if not proposal.any():
+            break
+        grown |= proposal
+    return grown
+
+
+def grow_fine_hair_region(
+    bok: np.ndarray,
+    seed: np.ndarray,
+    search: np.ndarray,
+    person_core: np.ndarray,
+    coarse_exclusion: np.ndarray,
+    nonhair_exclusion: np.ndarray,
+    line: np.ndarray,
+    blur_loss: np.ndarray,
+    score: np.ndarray,
+    alpha: np.ndarray,
+    semantic: np.ndarray,
+    args: argparse.Namespace,
+) -> dict[str, np.ndarray]:
+    """按颜色、方向一致性和细长几何约束扩展已确认发丝。"""
+
+    zero_bool = np.zeros_like(seed)
+    zero_float = np.zeros(seed.shape, np.float32)
+    if args.growth_radius <= 0 or not seed.any():
+        return {
+            "final": seed.copy(),
+            "added": zero_bool,
+            "allowed": zero_bool,
+            "color_similarity": zero_float,
+            "coherence": zero_float,
+            "confidence": zero_float,
+            "estimated_alpha": zero_float,
+        }
+
+    distance, color_delta, nearest_alpha = nearest_seed_features(bok, seed, alpha)
+    coherence = line_coherence_map(bok)
+    color_similarity = np.clip(
+        1.0 - color_delta / max(args.growth_color_delta, 1e-6),
+        0.0,
+        1.0,
+    )
+
+    # 常规区域仍遵守 Sapiens2 人体类别排除；只有紧邻发丝且证据很强时，
+    # 才允许短距离跨过 Face/Apparel 等语义区域，以恢复贴脸或压在衣服上的发丝。
+    hard_region = person_core | nonhair_exclusion
+    hard_override = (
+        (distance <= min(float(args.growth_radius), 8.0))
+        & (color_delta <= min(args.growth_color_delta, 12.0))
+        & (line >= max(args.growth_line_min, 0.12))
+        & (coherence >= max(args.growth_coherence_min, 0.35))
+        & (alpha >= max(args.growth_alpha_min, 0.02))
+    )
+
+    strong_geometry = (
+        (line >= max(args.growth_line_min * 1.8, 0.10))
+        & (coherence >= max(args.growth_coherence_min, 0.30))
+        & (color_delta <= args.growth_color_delta * 0.65)
+    )
+    evidence = (
+        (line >= args.growth_line_min)
+        & (coherence >= args.growth_coherence_min)
+        & (blur_loss <= args.growth_blur_max)
+        & (
+            (score >= args.growth_score_min)
+            | (alpha >= args.growth_alpha_min)
+            | (semantic >= 0.08)
+            | strong_geometry
+        )
+    )
+    allowed = (
+        search
+        & ~coarse_exclusion
+        & (distance <= float(args.growth_radius))
+        & (color_delta <= args.growth_color_delta)
+        & evidence
+        & (~hard_region | hard_override)
+    )
+
+    grown = grow_thin_connected_region(
+        seed,
+        allowed,
+        args.growth_radius,
+        args.growth_width_radius,
+        args.growth_max_neighbors,
+    )
+    added = grown & ~seed
+
+    line_confidence = np.clip(
+        (line - args.growth_line_min) / max(0.25 - args.growth_line_min, 1e-6),
+        0.0,
+        1.0,
+    )
+    coherence_confidence = np.clip(
+        (coherence - args.growth_coherence_min)
+        / max(1.0 - args.growth_coherence_min, 1e-6),
+        0.0,
+        1.0,
+    )
+    distance_confidence = np.clip(
+        1.0 - distance / max(float(args.growth_radius), 1.0),
+        0.0,
+        1.0,
+    )
+    confidence = (
+        0.40 * color_similarity
+        + 0.25 * line_confidence
+        + 0.20 * coherence_confidence
+        + 0.15 * distance_confidence
+    ) * added.astype(np.float32)
+    estimated_alpha = np.clip(
+        nearest_alpha
+        * (0.35 + 0.65 * confidence)
+        * args.growth_alpha_scale,
+        0.0,
+        1.0,
+    ) * added.astype(np.float32)
+    return {
+        "final": grown,
+        "added": added,
+        "allowed": allowed,
+        "color_similarity": color_similarity,
+        "coherence": coherence,
+        "confidence": confidence,
+        "estimated_alpha": estimated_alpha,
+    }
 
 
 def clean_hair_seed(seed: np.ndarray, requested_min_area: int) -> tuple[np.ndarray, int]:
@@ -575,8 +865,28 @@ def run_algorithm(
         args.gap_blur_max,
     )
 
-    # Alpha 保留 BiRefNet 的覆盖率；score 是检测置信度，二者不能混用。
-    fine_alpha = alpha * final.astype(np.float32)
+    pre_growth = final.copy()
+    growth = grow_fine_hair_region(
+        bok,
+        pre_growth,
+        search,
+        person_core,
+        coarse_exclusion,
+        nonhair_exclusion,
+        line,
+        blur_loss,
+        score,
+        alpha,
+        semantic,
+        args,
+    )
+    final = growth["final"]
+
+    # 已确认区域继续使用 BiRefNet 覆盖率；新增区域使用最近发丝 alpha 与
+    # 生长置信度传播，避免直接套用脸/衣服上的整个人像 alpha。
+    fine_alpha = alpha * pre_growth.astype(np.float32)
+    fine_alpha[growth["added"]] = growth["estimated_alpha"][growth["added"]]
+    final_score = np.maximum(score, growth["confidence"])
     return {
         "search": search,
         "person_core": person_core,
@@ -593,8 +903,15 @@ def run_algorithm(
         "before_thin": before_thin,
         "broad": broad,
         "gap_bridge": gap_bridge,
+        "pre_growth": pre_growth,
+        "growth_allowed": growth["allowed"],
+        "growth_color_similarity": growth["color_similarity"],
+        "growth_coherence": growth["coherence"],
+        "growth_added": growth["added"],
+        "growth_confidence": growth["confidence"],
         "final": final,
         "fine_alpha": fine_alpha,
+        "final_score": final_score,
     }
 
 
@@ -638,7 +955,28 @@ def save_debug(
         debug_dir / "16_directional_gap_bridge.png",
         stages["gap_bridge"],
     )
-    save_binary_visual(debug_dir / "17_final_mask_visual.png", stages["final"])
+    save_binary_visual(debug_dir / "17_pre_growth_mask.png", stages["pre_growth"])
+    save_u8(
+        debug_dir / "18_growth_color_similarity.png",
+        stages["growth_color_similarity"],
+    )
+    save_u8(
+        debug_dir / "19_growth_line_coherence.png",
+        stages["growth_coherence"],
+    )
+    save_binary_visual(
+        debug_dir / "20_growth_allowed.png",
+        stages["growth_allowed"],
+    )
+    save_binary_visual(
+        debug_dir / "21_region_growth_added.png",
+        stages["growth_added"],
+    )
+    save_u16(
+        debug_dir / "22_growth_confidence_16bit.png",
+        stages["growth_confidence"],
+    )
+    save_binary_visual(debug_dir / "23_final_mask_visual.png", stages["final"])
 
 
 def process_one(
@@ -729,6 +1067,7 @@ def process_one(
         18 + args.nonhair_radius,
         args.inner_band + args.thin_radius + 4,
         args.gap_close_radius * 2 + 4,
+        args.growth_width_radius + 8,
     )
     safe_roi_margin = args.outer_radius + filter_halo
     if 0 <= args.roi_margin < safe_roi_margin:
@@ -804,8 +1143,15 @@ def process_one(
             "before_thin": zero_bool,
             "broad": zero_bool,
             "gap_bridge": zero_bool,
+            "pre_growth": zero_bool,
+            "growth_allowed": zero_bool,
+            "growth_color_similarity": zero_float,
+            "growth_coherence": zero_float,
+            "growth_added": zero_bool,
+            "growth_confidence": zero_float,
             "final": zero_bool,
             "fine_alpha": zero_float,
+            "final_score": zero_float,
         }
         empty_reason = "有效种子为空，按 empty-policy=zero 输出空结果"
         print(f"[{sample.prefix}] 警告：{empty_reason}")
@@ -815,7 +1161,7 @@ def process_one(
     full_score = np.zeros((height, width), np.float32)
     full_final[roi] = stages["final"]
     full_alpha[roi] = stages["fine_alpha"]
-    full_score[roi] = stages["score"]
+    full_score[roi] = stages["final_score"]
 
     output_dir.mkdir(parents=True, exist_ok=True)
     save_binary_01(output_dir / "fine_hair_mask_01.png", full_final)
@@ -846,7 +1192,8 @@ def process_one(
         "algorithm": (
             "BiRefNet alpha 边缘 + Sapiens2 Hair 软先验 + "
             "多尺度中值细线响应 + EDOF/BOK 虚化负证据 + "
-            "受证据约束的四方向短缺口连接"
+            "受证据约束的四方向短缺口连接 + "
+            "颜色锚定与细长结构约束的有限区域生长"
         ),
         "inputs": sample_paths_to_json(sample),
         "fallback": {
@@ -875,6 +1222,17 @@ def process_one(
             "gap_line_min": args.gap_line_min,
             "gap_alpha_min": args.gap_alpha_min,
             "gap_blur_max": args.gap_blur_max,
+            "growth_preset": args.growth_preset,
+            "growth_radius": args.growth_radius,
+            "growth_color_delta": args.growth_color_delta,
+            "growth_line_min": args.growth_line_min,
+            "growth_score_min": args.growth_score_min,
+            "growth_alpha_min": args.growth_alpha_min,
+            "growth_blur_max": args.growth_blur_max,
+            "growth_coherence_min": args.growth_coherence_min,
+            "growth_width_radius": args.growth_width_radius,
+            "growth_max_neighbors": args.growth_max_neighbors,
+            "growth_alpha_scale": args.growth_alpha_scale,
             "hair_prob_threshold": args.hair_prob_threshold,
             "matte_seed_threshold": args.matte_seed_threshold,
             "roi_threshold": args.roi_threshold,
@@ -894,6 +1252,8 @@ def process_one(
             "before_thin": int(stages["before_thin"].sum()),
             "removed_broad": int(stages["broad"].sum()),
             "directional_gap_bridge": int(stages["gap_bridge"].sum()),
+            "pre_growth": int(stages["pre_growth"].sum()),
+            "region_growth_added": int(stages["growth_added"].sum()),
             "final": int(full_final.sum()),
         },
         "outputs": {
@@ -964,6 +1324,8 @@ def validate_arguments(args: argparse.Namespace, parser: argparse.ArgumentParser
         args.nonhair_radius,
         args.thin_radius,
         args.gap_close_radius,
+        args.growth_radius,
+        args.growth_width_radius,
     )
     if any(radius < 0 for radius in radii):
         parser.error("所有 radius 参数必须大于或等于 0")
@@ -973,6 +1335,10 @@ def validate_arguments(args: argparse.Namespace, parser: argparse.ArgumentParser
         parser.error("面积和尺度阈值必须大于或等于 0")
     if args.low_score > args.high_score:
         parser.error("--low-score 不能大于 --high-score")
+    if args.growth_color_delta <= 0.0:
+        parser.error("--growth-color-delta 必须大于 0")
+    if not 1 <= args.growth_max_neighbors <= 8:
+        parser.error("--growth-max-neighbors 必须位于 1～8")
     for name in (
         "hair_prob_threshold",
         "matte_seed_threshold",
@@ -985,11 +1351,26 @@ def validate_arguments(args: argparse.Namespace, parser: argparse.ArgumentParser
         "gap_line_min",
         "gap_alpha_min",
         "gap_blur_max",
+        "growth_line_min",
+        "growth_score_min",
+        "growth_alpha_min",
+        "growth_blur_max",
+        "growth_coherence_min",
+        "growth_alpha_scale",
         "blend_opacity",
     ):
         value = getattr(args, name)
         if not 0.0 <= value <= 1.0:
             parser.error(f"--{name.replace('_', '-')} 必须位于 0～1")
+
+
+def apply_growth_preset(args: argparse.Namespace) -> None:
+    """应用区域生长预设；命令行显式给出的高级参数拥有更高优先级。"""
+
+    preset = GROWTH_PRESETS[args.growth_preset]
+    for name, value in preset.items():
+        if getattr(args, name) is None:
+            setattr(args, name, value)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1074,6 +1455,75 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.35,
         help="允许桥接的最大 EDOF/BOK 虚化负证据",
     )
+    parser.add_argument(
+        "--growth-preset",
+        choices=tuple(GROWTH_PRESETS),
+        default="balanced",
+        help=(
+            "区域生长档位：off 关闭；conservative 保守；"
+            "balanced 平衡（默认）；recall 高召回"
+        ),
+    )
+    parser.add_argument(
+        "--growth-radius",
+        type=int,
+        default=None,
+        help="从已确认细发丝向外生长的最大像素距离",
+    )
+    parser.add_argument(
+        "--growth-color-delta",
+        type=float,
+        default=None,
+        help="生长像素与最近原始发丝种子的最大 Lab 色差",
+    )
+    parser.add_argument(
+        "--growth-line-min",
+        type=float,
+        default=None,
+        help="区域生长所需的最小细线响应",
+    )
+    parser.add_argument(
+        "--growth-score-min",
+        type=float,
+        default=None,
+        help="区域生长所需的最小原始综合分数",
+    )
+    parser.add_argument(
+        "--growth-alpha-min",
+        type=float,
+        default=None,
+        help="区域生长所需的最小 BiRefNet alpha 证据",
+    )
+    parser.add_argument(
+        "--growth-blur-max",
+        type=float,
+        default=None,
+        help="区域生长允许的最大 EDOF/BOK 虚化负证据",
+    )
+    parser.add_argument(
+        "--growth-coherence-min",
+        type=float,
+        default=None,
+        help="区域生长所需的最小局部方向一致性",
+    )
+    parser.add_argument(
+        "--growth-width-radius",
+        type=int,
+        default=None,
+        help="抑制生长结果变成宽块的形态学检测半径",
+    )
+    parser.add_argument(
+        "--growth-max-neighbors",
+        type=int,
+        default=None,
+        help="每轮生长允许的最大八邻域已生长像素数",
+    )
+    parser.add_argument(
+        "--growth-alpha-scale",
+        type=float,
+        default=None,
+        help="新增区域继承最近发丝 alpha 时的缩放系数",
+    )
     parser.add_argument("--hair-prob-threshold", type=float, default=0.45, help="Hair 概率种子阈值")
     parser.add_argument("--matte-seed-threshold", type=float, default=0.50, help="Hair 全缺失时的 matte 种子阈值")
     parser.add_argument("--roi-threshold", type=float, default=0.05, help="生成 ROI 外接框的 mask 阈值")
@@ -1100,6 +1550,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
+    apply_growth_preset(args)
     validate_arguments(args, parser)
     args.output.mkdir(parents=True, exist_ok=True)
 
