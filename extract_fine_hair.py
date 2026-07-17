@@ -417,15 +417,41 @@ def grow_thin_connected_region(
     return grown
 
 
+def prune_dense_growth(
+    grown: np.ndarray,
+    seed: np.ndarray,
+    window_size: int,
+    maximum_density: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """删除局部过密的网状新增区域，只保留仍与原始发丝连通的细长分支。"""
+
+    added = grown & ~seed
+    if not added.any() or window_size <= 1:
+        return grown, np.zeros_like(seed)
+    density = cv2.boxFilter(
+        added.astype(np.float32),
+        cv2.CV_32F,
+        (window_size, window_size),
+        normalize=True,
+    )
+    dense = added & (density > maximum_density)
+    sparse = added & ~dense
+    connected = keep_seed_connected(sparse, seed)
+    final = seed | connected
+    return final, grown & ~final
+
+
 def grow_fine_hair_region(
     bok: np.ndarray,
+    edof: np.ndarray,
     seed: np.ndarray,
     core_search: np.ndarray,
     growth_search: np.ndarray,
     person_core: np.ndarray,
     coarse_exclusion: np.ndarray,
     nonhair_exclusion: np.ndarray,
-    line: np.ndarray,
+    bok_line: np.ndarray,
+    edof_line: np.ndarray,
     blur_loss: np.ndarray,
     score: np.ndarray,
     alpha: np.ndarray,
@@ -445,16 +471,66 @@ def grow_fine_hair_region(
             "extension_allowed": zero_bool,
             "color_similarity": zero_float,
             "coherence": zero_float,
+            "edof_rescue": zero_bool,
+            "fused_line": zero_float,
+            "dense_removed": zero_bool,
             "confidence": zero_float,
             "estimated_alpha": zero_float,
         }
 
     distance, color_delta, nearest_alpha = nearest_seed_features(bok, seed, alpha)
-    coherence = line_coherence_map(bok)
+    bok_coherence = line_coherence_map(bok)
+    edof_coherence = cv2.dilate(
+        line_coherence_map(edof),
+        ellipse(args.edof_tolerance_radius),
+    )
+    if args.growth_image == "bok":
+        line = bok_line
+        coherence = bok_coherence
+    elif args.growth_image == "edof":
+        line = edof_line
+        coherence = edof_coherence
+    else:
+        shared_line = np.sqrt(np.clip(bok_line * edof_line, 0.0, 1.0))
+        shared_coherence = np.sqrt(
+            np.clip(bok_coherence * edof_coherence, 0.0, 1.0)
+        )
+        line = np.maximum(bok_line, args.edof_line_weight * shared_line)
+        coherence = np.maximum(
+            bok_coherence,
+            args.edof_line_weight * shared_coherence,
+        )
     color_similarity = np.clip(
         1.0 - color_delta / max(args.growth_color_delta, 1e-6),
         0.0,
         1.0,
+    )
+    # EDOF 中强且连续、BOK 中仍有微弱线索的细线可在 alpha/语义漏检时
+    # 提供救援证据；颜色仍锚定 BOK，避免把两图几何差异硬写入最终 mask。
+    strong_shared_geometry = (
+        (bok_line >= max(args.edof_bok_support_min, 0.040))
+        & (edof_line >= max(args.growth_line_min * 2.0, 0.12))
+        & (bok_coherence >= 0.35)
+        & (edof_coherence >= 0.45)
+        & (color_delta <= args.growth_color_delta * 0.38)
+    )
+    edof_rescue = (
+        (bok_line >= max(args.edof_bok_support_min, 0.040))
+        & (edof_line >= max(args.growth_line_min * 1.8, 0.10))
+        & (bok_coherence >= 0.20)
+        & (edof_coherence >= max(args.growth_coherence_min + 0.15, 0.42))
+        & (color_delta <= args.growth_color_delta * 0.48)
+        & (
+            (alpha >= max(args.growth_alpha_min, 0.001))
+            | (semantic >= 0.04)
+            | (distance <= 12.0)
+            | strong_shared_geometry
+        )
+    )
+    if args.growth_image == "bok":
+        edof_rescue = zero_bool
+    effective_blur_loss = blur_loss * (
+        1.0 - args.edof_rescue_strength * edof_rescue.astype(np.float32)
     )
 
     # 常规区域仍遵守 Sapiens2 人体类别排除；只有紧邻发丝且证据很强时，
@@ -476,12 +552,13 @@ def grow_fine_hair_region(
     evidence = (
         (line >= args.growth_line_min)
         & (coherence >= args.growth_coherence_min)
-        & (blur_loss <= args.growth_blur_max)
+        & (effective_blur_loss <= args.growth_blur_max)
         & (
             (score >= args.growth_score_min)
             | (alpha >= args.growth_alpha_min)
             | (semantic >= 0.08)
             | strong_geometry
+            | edof_rescue
         )
     )
     common_allowed = (
@@ -500,10 +577,11 @@ def grow_fine_hair_region(
         & (color_delta <= args.growth_color_delta * 0.72)
         & (line >= max(args.growth_line_min * 1.25, 0.065))
         & (coherence >= min(args.growth_coherence_min + 0.10, 0.95))
-        & (blur_loss <= args.growth_blur_max * 0.90)
+        & (effective_blur_loss <= args.growth_blur_max * 0.90)
         & (
             (alpha >= max(args.growth_alpha_min * 2.0, 0.002))
             | (semantic >= 0.12)
+            | edof_rescue
         )
         & ~hard_region
     )
@@ -517,6 +595,77 @@ def grow_fine_hair_region(
         args.growth_width_radius,
         args.growth_max_neighbors,
     )
+    if args.growth_image == "dual":
+        # 双图模式先完整保留 BOK 单图生长结果，只对 EDOF 额外贡献执行
+        # 密度抑制，避免为了清理背景网纹反而删掉原本可靠的 BOK 发丝。
+        bok_hard_override = (
+            (distance <= min(float(effective_growth_radius), 8.0))
+            & (color_delta <= min(args.growth_color_delta, 12.0))
+            & (bok_line >= max(args.growth_line_min, 0.12))
+            & (bok_coherence >= max(args.growth_coherence_min, 0.35))
+            & (alpha >= max(args.growth_alpha_min, 0.02))
+        )
+        bok_strong_geometry = (
+            (bok_line >= max(args.growth_line_min * 1.8, 0.10))
+            & (bok_coherence >= max(args.growth_coherence_min, 0.30))
+            & (color_delta <= args.growth_color_delta * 0.65)
+        )
+        bok_evidence = (
+            (bok_line >= args.growth_line_min)
+            & (bok_coherence >= args.growth_coherence_min)
+            & (blur_loss <= args.growth_blur_max)
+            & (
+                (score >= args.growth_score_min)
+                | (alpha >= args.growth_alpha_min)
+                | (semantic >= 0.08)
+                | bok_strong_geometry
+            )
+        )
+        bok_common_allowed = (
+            growth_search
+            & ~coarse_exclusion
+            & (distance <= float(effective_growth_radius))
+            & (color_delta <= args.growth_color_delta)
+            & bok_evidence
+            & (~hard_region | bok_hard_override)
+        )
+        bok_extension_evidence = (
+            ~core_search
+            & (color_delta <= args.growth_color_delta * 0.72)
+            & (bok_line >= max(args.growth_line_min * 1.25, 0.065))
+            & (bok_coherence >= min(args.growth_coherence_min + 0.10, 0.95))
+            & (blur_loss <= args.growth_blur_max * 0.90)
+            & (
+                (alpha >= max(args.growth_alpha_min * 2.0, 0.002))
+                | (semantic >= 0.12)
+            )
+            & ~hard_region
+        )
+        bok_allowed = bok_common_allowed & (
+            core_search | bok_extension_evidence
+        )
+        bok_grown = grow_thin_connected_region(
+            seed,
+            bok_allowed,
+            effective_growth_radius,
+            args.growth_width_radius,
+            args.growth_max_neighbors,
+        )
+        grown, dense_removed = prune_dense_growth(
+            grown | bok_grown,
+            bok_grown,
+            args.edof_density_window,
+            args.edof_density_max,
+        )
+    elif args.growth_image == "edof":
+        grown, dense_removed = prune_dense_growth(
+            grown,
+            seed,
+            args.edof_density_window,
+            args.edof_density_max,
+        )
+    else:
+        dense_removed = zero_bool
     added = grown & ~seed
 
     line_confidence = np.clip(
@@ -555,6 +704,9 @@ def grow_fine_hair_region(
         "extension_allowed": extension_allowed,
         "color_similarity": color_similarity,
         "coherence": coherence,
+        "edof_rescue": edof_rescue,
+        "fused_line": line,
+        "dense_removed": dense_removed,
         "confidence": confidence,
         "estimated_alpha": estimated_alpha,
     }
@@ -891,6 +1043,10 @@ def run_algorithm(
         if args.search_mode == "adaptive" and effective_growth_radius > 0
         else line
     )
+    edof_growth_line = cv2.dilate(
+        median_line_response(edof, growth_search),
+        ellipse(args.edof_tolerance_radius),
+    )
     blur_loss = blur_loss_map(bok, edof)
     semantic = cv2.dilate(semantic_probability, ellipse(18))
     alpha_edge = cv2.morphologyEx(alpha, cv2.MORPH_GRADIENT, ellipse(2))
@@ -956,7 +1112,7 @@ def run_algorithm(
         final,
         before_thin,
         score,
-        growth_line,
+        line,
         alpha,
         blur_loss,
         args.gap_close_radius,
@@ -969,13 +1125,15 @@ def run_algorithm(
     pre_growth = final.copy()
     growth = grow_fine_hair_region(
         bok,
+        edof,
         pre_growth,
         search,
         growth_search,
         person_core,
         coarse_exclusion,
         nonhair_exclusion,
-        line,
+        growth_line,
+        edof_growth_line,
         blur_loss,
         score,
         alpha,
@@ -999,6 +1157,8 @@ def run_algorithm(
         "fringe_zone": fringe_zone,
         "line": line,
         "growth_line": growth_line,
+        "edof_growth_line": edof_growth_line,
+        "fused_growth_line": growth["fused_line"],
         "blur_loss": blur_loss,
         "alpha_edge": alpha_edge,
         "score": score,
@@ -1014,6 +1174,8 @@ def run_algorithm(
         "growth_extension_added": growth["added"] & ~search,
         "growth_color_similarity": growth["color_similarity"],
         "growth_coherence": growth["coherence"],
+        "edof_rescue": growth["edof_rescue"],
+        "edof_dense_removed": growth["dense_removed"],
         "growth_added": growth["added"],
         "growth_confidence": growth["confidence"],
         "final": final,
@@ -1097,6 +1259,22 @@ def save_debug(
         stages["growth_extension_allowed"],
     )
     save_u8(debug_dir / "27_growth_line_response.png", stages["growth_line"])
+    save_u8(
+        debug_dir / "28_edof_growth_line_response.png",
+        stages["edof_growth_line"],
+    )
+    save_u8(
+        debug_dir / "29_fused_growth_line_response.png",
+        stages["fused_growth_line"],
+    )
+    save_binary_visual(
+        debug_dir / "30_edof_rescue.png",
+        stages["edof_rescue"],
+    )
+    save_binary_visual(
+        debug_dir / "31_edof_dense_removed.png",
+        stages["edof_dense_removed"],
+    )
 
 
 def process_one(
@@ -1272,6 +1450,8 @@ def process_one(
             "fringe_zone": zero_bool,
             "line": zero_float,
             "growth_line": zero_float,
+            "edof_growth_line": zero_float,
+            "fused_growth_line": zero_float,
             "blur_loss": zero_float,
             "alpha_edge": zero_float,
             "score": zero_float,
@@ -1287,6 +1467,8 @@ def process_one(
             "growth_extension_added": zero_bool,
             "growth_color_similarity": zero_float,
             "growth_coherence": zero_float,
+            "edof_rescue": zero_bool,
+            "edof_dense_removed": zero_bool,
             "growth_added": zero_bool,
             "growth_confidence": zero_float,
             "final": zero_bool,
@@ -1333,7 +1515,8 @@ def process_one(
             "BiRefNet alpha 边缘 + Sapiens2 Hair 软先验 + "
             "多尺度中值细线响应 + EDOF/BOK 虚化负证据 + "
             "受证据约束的四方向短缺口连接 + "
-            "自适应双层搜索区 + 颜色锚定与细长结构约束的远距离区域生长"
+            "自适应双层搜索区 + BOK 颜色锚定 + "
+            "EDOF 容差细线增强与过密纹理抑制的远距离区域生长"
         ),
         "inputs": sample_paths_to_json(sample),
         "fallback": {
@@ -1369,6 +1552,13 @@ def process_one(
             "gap_alpha_min": args.gap_alpha_min,
             "gap_blur_max": args.gap_blur_max,
             "growth_preset": args.growth_preset,
+            "growth_image": args.growth_image,
+            "edof_line_weight": args.edof_line_weight,
+            "edof_tolerance_radius": args.edof_tolerance_radius,
+            "edof_bok_support_min": args.edof_bok_support_min,
+            "edof_rescue_strength": args.edof_rescue_strength,
+            "edof_density_window": args.edof_density_window,
+            "edof_density_max": args.edof_density_max,
             "growth_radius": args.growth_radius,
             "growth_radius_scale": args.growth_radius_scale,
             "growth_max_radius": args.growth_max_radius,
@@ -1480,6 +1670,7 @@ def validate_arguments(args: argparse.Namespace, parser: argparse.ArgumentParser
         args.growth_radius,
         args.growth_max_radius,
         args.growth_width_radius,
+        args.edof_tolerance_radius,
     )
     if any(radius < 0 for radius in radii):
         parser.error("所有 radius 参数必须大于或等于 0")
@@ -1495,6 +1686,8 @@ def validate_arguments(args: argparse.Namespace, parser: argparse.ArgumentParser
         parser.error("搜索和生长的 radius-scale 必须大于或等于 0")
     if not 1 <= args.growth_max_neighbors <= 8:
         parser.error("--growth-max-neighbors 必须位于 1～8")
+    if args.edof_density_window <= 1 or args.edof_density_window % 2 == 0:
+        parser.error("--edof-density-window 必须是大于 1 的奇数")
     for name in (
         "hair_prob_threshold",
         "matte_seed_threshold",
@@ -1513,6 +1706,10 @@ def validate_arguments(args: argparse.Namespace, parser: argparse.ArgumentParser
         "growth_blur_max",
         "growth_coherence_min",
         "growth_alpha_scale",
+        "edof_line_weight",
+        "edof_bok_support_min",
+        "edof_rescue_strength",
+        "edof_density_max",
         "blend_opacity",
     ):
         value = getattr(args, name)
@@ -1642,6 +1839,48 @@ def build_parser() -> argparse.ArgumentParser:
             "区域生长档位：off 关闭；conservative 保守；"
             "balanced 平衡（默认）；recall 高召回"
         ),
+    )
+    parser.add_argument(
+        "--growth-image",
+        choices=("bok", "dual", "edof"),
+        default="dual",
+        help="区域生长细线证据来源；默认融合 BOK 与容差对齐后的 EDOF",
+    )
+    parser.add_argument(
+        "--edof-line-weight",
+        type=float,
+        default=0.85,
+        help="dual 模式下 EDOF 细线与方向证据权重",
+    )
+    parser.add_argument(
+        "--edof-tolerance-radius",
+        type=int,
+        default=3,
+        help="允许 EDOF/BOK 发丝几何偏移的局部最大值半径",
+    )
+    parser.add_argument(
+        "--edof-bok-support-min",
+        type=float,
+        default=0.040,
+        help="仅靠 EDOF 救援候选时，BOK 仍需保留的最低细线响应",
+    )
+    parser.add_argument(
+        "--edof-rescue-strength",
+        type=float,
+        default=0.35,
+        help="EDOF 强发丝证据对虚化负证据的最大抵消比例",
+    )
+    parser.add_argument(
+        "--edof-density-window",
+        type=int,
+        default=15,
+        help="抑制 EDOF 网状纹理误检的局部密度窗口，必须为大于 1 的奇数",
+    )
+    parser.add_argument(
+        "--edof-density-max",
+        type=float,
+        default=0.18,
+        help="EDOF 辅助生长允许的最大局部新增像素密度",
     )
     parser.add_argument(
         "--growth-radius",

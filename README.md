@@ -73,10 +73,10 @@ fine_hair_score_16bit.png      16-bit 融合置信度
 fine_hair_bok_blend.png        01 mask 与完整 BOK 的红色混合验收图
 fine_hair_overlay.jpg          JPEG 兼容预览
 validation_report.json         尺寸、位深、二值性自动检查
-debug/00_*.jpg、01_*.png...    按 `00_`～`27_` 处理步骤编号的 ROI 尺寸诊断图
+debug/00_*.jpg、01_*.png...    按 `00_`～`31_` 处理步骤编号的 ROI 尺寸诊断图
 ```
 
-算法组合：Sapiens2 Hair 语义邻域 → 按图像分辨率和 Hair 主体尺度生成自适应常规搜索区 → 排除 Face/Apparel/Clothing 类边界 → BiRefNet alpha 边缘 → BOK 多尺度中值残差 → EDOF/BOK 清晰度负证据 → 双阈值连通 → 只保留约 12 像素 Hair 内侧边缘带 → 形态学宽结构剔除 → 四方向高置信短缺口连接 → 颜色和细长结构约束的远距离延伸区生长。
+算法组合：Sapiens2 Hair 语义邻域 → 按图像分辨率和 Hair 主体尺度生成自适应常规搜索区 → 排除 Face/Apparel/Clothing 类边界 → BiRefNet alpha 边缘 → BOK 多尺度中值残差 → EDOF 容差细线增强与 EDOF/BOK 清晰度负证据 → 双阈值连通 → 只保留约 12 像素 Hair 内侧边缘带 → 形态学宽结构剔除 → 四方向高置信短缺口连接 → BOK 颜色锚定、双图线索和细长结构约束的远距离生长。
 
 默认使用 `--search-mode adaptive`。常规搜索半径取“4K 参考半径”和“Hair 主体最长边比例”中的较大值并设置分辨率相关上限；远距离延伸半径再由区域生长预设决定。超出常规搜索区后会自动提高颜色、方向一致性、细线、alpha/Hair 证据和虚化负证据门槛，因此不是在整张图上无约束生长。区域生长把生长前已确认的发丝作为固定颜色锚点，不会把新增像素继续当作颜色基准而产生颜色漂移。
 
@@ -101,6 +101,8 @@ debug/00_*.jpg、01_*.png...    按 `00_`～`27_` 处理步骤编号的 ROI 尺�
 ```
 
 背景误检增加时，优先退回 `balanced/conservative`，或降低 `--search-radius-scale`，不要取消搜索区硬上限。`--growth-radius-scale`、`--growth-max-radius`、`--growth-color-delta`、`--growth-line-min` 和 `--growth-coherence-min` 均可逐项覆盖预设。
+
+默认 `--growth-image dual`：BOK 决定最终坐标、颜色锚点和完整基础结果；EDOF 只在 3px 容差内增强细线/方向证据。EDOF 新增部分会经过 15×15 局部密度过滤，避免清晰墙纹、树枝或电线形成网状误检。2p 中 BOK-only 为 43,296 像素，安全 dual 为 44,504；未经门控直接使用 EDOF 会产生明显墙面误检，因此 `--growth-image edof` 仅用于诊断，不建议作为生产默认值。可用 `debug/28_*`～`31_*` 检查 EDOF 响应、融合响应、救援候选和被删除的过密区域。
 
 需要恢复旧版更保守的输出时：
 
@@ -198,6 +200,28 @@ debug/00_* ～ 06_*             重建区域、融合权重和差值诊断图
 ```
 
 `--method median` 可用于快速对照，但人物轮廓附近可能把主体颜色带入背景；`--method hybrid` 会给 Telea 结果混入少量中值结果。默认 `--method inpaint` 对 2p 样例最稳妥。残留亮边可提高 `--expand-radius` 到 3；边缘过软可把 `--feather-sigma` 降到 1.5；背景本身非常虚时可提高 `--background-blur-sigma`。
+
+## 从 EDOF 去除细发丝
+
+同一个脚本可用 EDOF 专用默认参数执行自然修复：Telea 半径 3、mask 外扩 1px、羽化 sigma 1.0，并完全关闭 BOK 专用高斯背景模糊，尽量保持清晰背景纹理。
+
+```powershell
+python hair_bokeh.py `
+  --target edof `
+  --prefix D:\images\base\2p `
+  --fine-dir D:\results\2p\final `
+  --output D:\results\2p\edof-hair-remove
+```
+
+主要输出：
+
+```text
+hair_removed_edof.png
+hair_removed_edof_compare.jpg
+hair_remove_metadata.json
+```
+
+如果输入是原始分辨率 EDOF，而细发丝 mask 位于 BOK 规范分辨率，默认 `--mask-size-policy resize` 会用最近邻缩放二值 mask、双线性缩放 alpha 并保持 EDOF 原始输出尺寸；严格要求同尺寸时可改为 `--mask-size-policy error`。Telea 适合这种窄而长的 scratch-like 区域；不要在 EDOF 模式使用默认 BOK 模糊参数，否则修复处会比周围背景更软。复杂重复纹理或跨越明显物体边界的长发丝仍可能需要 PatchMatch/LaMa 一类更强的内容补全模型。
 
 ## 许可
 

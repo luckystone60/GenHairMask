@@ -99,13 +99,23 @@ def resolve_inputs(args: argparse.Namespace) -> tuple[Path, Path, Path | None, s
     else:
         prefix_path = None
 
-    bok = args.bok.expanduser() if args.bok is not None else None
-    if bok is None and prefix_path is not None:
-        bok = find_prefixed_image(prefix_path, "_bok")
-    if bok is None:
-        raise ValueError("必须提供 --bok，或提供能找到 <prefix>_bok.* 的 --prefix")
+    explicit_source = args.edof if args.target == "edof" else args.bok
+    source = explicit_source.expanduser() if explicit_source is not None else None
+    suffix = "_edof" if args.target == "edof" else "_bok"
+    if source is None and prefix_path is not None:
+        source = find_prefixed_image(prefix_path, suffix)
+    if source is None:
+        option = "--edof" if args.target == "edof" else "--bok"
+        raise ValueError(
+            f"target={args.target} 时必须提供 {option}，"
+            f"或提供能找到 <prefix>{suffix}.* 的 --prefix"
+        )
     if prefix_path is None:
-        prefix_name = bok.stem[:-4] if bok.stem.casefold().endswith("_bok") else bok.stem
+        prefix_name = (
+            source.stem[: -len(suffix)]
+            if source.stem.casefold().endswith(suffix)
+            else source.stem
+        )
 
     mask = args.mask
     alpha = args.alpha
@@ -133,7 +143,7 @@ def resolve_inputs(args: argparse.Namespace) -> tuple[Path, Path, Path | None, s
                 ),
             )
 
-    return Path(bok), Path(mask), Path(alpha) if alpha is not None else None, prefix_name
+    return Path(source), Path(mask), Path(alpha) if alpha is not None else None, prefix_name
 
 
 def compute_roi(mask: np.ndarray, margin: int) -> tuple[int, int, int, int]:
@@ -208,7 +218,7 @@ def build_processing_masks(
 
 
 def reconstruct_background(
-    bok_roi: np.ndarray,
+    source_roi: np.ndarray,
     inpaint_mask: np.ndarray,
     method: str,
     inpaint_radius: float,
@@ -217,21 +227,21 @@ def reconstruct_background(
     background_blur_sigma: float,
     background_blur_strength: float,
 ) -> np.ndarray:
-    """重建细发丝后方背景，再做轻微低通以贴近 BOK 的模糊形态。"""
+    """重建细发丝后方背景；是否低通由 BOK/EDOF 目标默认参数决定。"""
 
     mask_u8 = inpaint_mask.astype(np.uint8) * 255
     if method in {"inpaint", "hybrid"}:
         flag = cv2.INPAINT_TELEA if inpaint_backend == "telea" else cv2.INPAINT_NS
-        inpainted = cv2.inpaint(bok_roi, mask_u8, inpaint_radius, flag)
+        inpainted = cv2.inpaint(source_roi, mask_u8, inpaint_radius, flag)
     else:
-        inpainted = bok_roi.copy()
+        inpainted = source_roi.copy()
 
     if method in {"median", "hybrid"}:
-        shortest = min(bok_roi.shape[:2])
+        shortest = min(source_roi.shape[:2])
         effective_kernel = min(median_kernel, shortest if shortest % 2 == 1 else shortest - 1)
         if effective_kernel <= 1:
             raise ValueError("ROI 太小，无法执行中值滤波")
-        median = cv2.medianBlur(bok_roi, effective_kernel)
+        median = cv2.medianBlur(source_roi, effective_kernel)
         if method == "median":
             reconstructed = median
         else:
@@ -278,19 +288,24 @@ def feather_blend(
     return result
 
 
-def make_comparison(original: np.ndarray, result: np.ndarray) -> np.ndarray:
+def make_comparison(
+    original: np.ndarray,
+    result: np.ndarray,
+    source_label: str,
+    result_label: str,
+) -> np.ndarray:
     """生成原图与处理结果的左右对比图。"""
 
     comparison = np.concatenate((original, result), axis=1)
     font = cv2.FONT_HERSHEY_SIMPLEX
     scale = max(0.7, original.shape[1] / 1800.0)
     thickness = max(2, int(round(scale * 2)))
-    cv2.putText(comparison, "BOK", (24, 52), font, scale, (0, 0, 0), thickness + 3)
-    cv2.putText(comparison, "BOK", (24, 52), font, scale, (255, 255, 255), thickness)
+    cv2.putText(comparison, source_label, (24, 52), font, scale, (0, 0, 0), thickness + 3)
+    cv2.putText(comparison, source_label, (24, 52), font, scale, (255, 255, 255), thickness)
     offset = original.shape[1]
     cv2.putText(
         comparison,
-        "HAIR BOKEH",
+        result_label,
         (offset + 24, 52),
         font,
         scale,
@@ -299,7 +314,7 @@ def make_comparison(original: np.ndarray, result: np.ndarray) -> np.ndarray:
     )
     cv2.putText(
         comparison,
-        "HAIR BOKEH",
+        result_label,
         (offset + 24, 52),
         font,
         scale,
@@ -310,15 +325,30 @@ def make_comparison(original: np.ndarray, result: np.ndarray) -> np.ndarray:
 
 
 def process(args: argparse.Namespace) -> dict:
-    """执行细发丝背景化并保存完整分辨率结果。"""
+    """执行 BOK 发丝背景化或 EDOF 清晰背景修复。"""
 
-    bok_path, mask_path, alpha_path, prefix_name = resolve_inputs(args)
-    bok = read_color(bok_path)
+    source_path, mask_path, alpha_path, prefix_name = resolve_inputs(args)
+    source = read_color(source_path)
     binary = read_float_mask(mask_path) >= args.mask_threshold
     alpha = read_float_mask(alpha_path) if alpha_path is not None else None
+    original_mask_shape = binary.shape
 
-    if binary.shape != bok.shape[:2]:
-        raise ValueError(f"BOK 与二值 mask 尺寸不一致：{bok.shape[:2]} vs {binary.shape}")
+    if binary.shape != source.shape[:2]:
+        if args.mask_size_policy == "error":
+            raise ValueError(
+                f"源图与二值 mask 尺寸不一致：{source.shape[:2]} vs {binary.shape}"
+            )
+        binary = cv2.resize(
+            binary.astype(np.uint8),
+            (source.shape[1], source.shape[0]),
+            interpolation=cv2.INTER_NEAREST,
+        ).astype(bool)
+        if alpha is not None:
+            alpha = cv2.resize(
+                alpha,
+                (source.shape[1], source.shape[0]),
+                interpolation=cv2.INTER_LINEAR,
+            )
     if alpha is not None and alpha.shape != binary.shape:
         raise ValueError(f"二值 mask 与 alpha 尺寸不一致：{binary.shape} vs {alpha.shape}")
     if alpha is not None and binary.any():
@@ -344,12 +374,12 @@ def process(args: argparse.Namespace) -> dict:
     )
     roi_margin = max(args.roi_margin, filter_halo) if args.roi_margin >= 0 else filter_halo
     if args.no_roi:
-        x0, y0, x1, y1 = 0, 0, bok.shape[1], bok.shape[0]
+        x0, y0, x1, y1 = 0, 0, source.shape[1], source.shape[0]
     else:
         x0, y0, x1, y1 = compute_roi(support, roi_margin)
     roi = np.s_[y0:y1, x0:x1]
 
-    bok_roi = bok[roi]
+    source_roi = source[roi]
     binary_roi = binary[roi]
     alpha_roi = alpha[roi] if alpha is not None else None
     core, inpaint_mask, blend_weight = build_processing_masks(
@@ -360,7 +390,7 @@ def process(args: argparse.Namespace) -> dict:
         args.feather_sigma,
     )
     reconstructed = reconstruct_background(
-        bok_roi,
+        source_roi,
         inpaint_mask,
         args.method,
         args.inpaint_radius,
@@ -369,22 +399,38 @@ def process(args: argparse.Namespace) -> dict:
         args.background_blur_sigma,
         args.background_blur_strength,
     )
-    result_roi = feather_blend(bok_roi, reconstructed, blend_weight)
+    result_roi = feather_blend(source_roi, reconstructed, blend_weight)
 
-    result = bok.copy()
+    result = source.copy()
     result[roi] = result_roi
     output_dir = args.output.expanduser()
     output_dir.mkdir(parents=True, exist_ok=True)
-    write_image(output_dir / "hair_bokeh.png", result)
+    result_name = "hair_removed_edof.png" if args.target == "edof" else "hair_bokeh.png"
+    compare_name = (
+        "hair_removed_edof_compare.jpg"
+        if args.target == "edof"
+        else "hair_bokeh_compare.jpg"
+    )
+    metadata_name = (
+        "hair_remove_metadata.json"
+        if args.target == "edof"
+        else "hair_bokeh_metadata.json"
+    )
+    write_image(output_dir / result_name, result)
     write_image(
-        output_dir / "hair_bokeh_compare.jpg",
-        make_comparison(bok, result),
+        output_dir / compare_name,
+        make_comparison(
+            source,
+            result,
+            args.target.upper(),
+            "HAIR REMOVED" if args.target == "edof" else "HAIR BOKEH",
+        ),
         [cv2.IMWRITE_JPEG_QUALITY, 94],
     )
 
     if not args.no_debug:
         debug_dir = output_dir / "debug"
-        write_image(debug_dir / "00_bok_roi.jpg", bok_roi, [cv2.IMWRITE_JPEG_QUALITY, 95])
+        write_image(debug_dir / "00_source_roi.jpg", source_roi, [cv2.IMWRITE_JPEG_QUALITY, 95])
         write_image(debug_dir / "01_fine_hair_core.png", core.astype(np.uint8) * 255)
         write_image(debug_dir / "02_inpaint_region.png", inpaint_mask.astype(np.uint8) * 255)
         write_image(
@@ -392,23 +438,31 @@ def process(args: argparse.Namespace) -> dict:
             np.rint(blend_weight * 65535.0).astype(np.uint16),
         )
         write_image(debug_dir / "04_reconstructed_background.png", reconstructed)
-        difference = cv2.absdiff(bok_roi, result_roi)
+        difference = cv2.absdiff(source_roi, result_roi)
         write_image(debug_dir / "05_absolute_difference.png", difference)
-        write_image(debug_dir / "06_hair_bokeh_roi.png", result_roi)
+        write_image(debug_dir / "06_result_roi.png", result_roi)
 
-    changed = np.any(result != bok, axis=2)
+    changed = np.any(result != source, axis=2)
     metadata = {
         "prefix": prefix_name,
         "inputs": {
-            "bok": str(bok_path),
+            "source": str(source_path),
+            "bok": str(source_path) if args.target == "bok" else None,
+            "edof": str(source_path) if args.target == "edof" else None,
             "mask": str(mask_path),
             "alpha": str(alpha_path) if alpha_path is not None else None,
         },
-        "resolution_wh": [int(bok.shape[1]), int(bok.shape[0])],
+        "target": args.target,
+        "resolution_wh": [int(source.shape[1]), int(source.shape[0])],
+        "original_mask_resolution_wh": [
+            int(original_mask_shape[1]),
+            int(original_mask_shape[0]),
+        ],
         "roi_bbox_xyxy": [x0, y0, x1, y1],
         "roi_enabled": not args.no_roi,
         "parameters": {
             "method": args.method,
+            "mask_size_policy": args.mask_size_policy,
             "mask_threshold": args.mask_threshold,
             "alpha_threshold": args.alpha_threshold,
             "expand_radius": args.expand_radius,
@@ -425,16 +479,23 @@ def process(args: argparse.Namespace) -> dict:
             "changed_full_image": int(changed.sum()),
         },
         "outputs": {
-            "hair_bokeh": str(output_dir / "hair_bokeh.png"),
-            "comparison": str(output_dir / "hair_bokeh_compare.jpg"),
+            "result": str(output_dir / result_name),
+            "hair_bokeh": (
+                str(output_dir / result_name) if args.target == "bok" else None
+            ),
+            "hair_removed_edof": (
+                str(output_dir / result_name) if args.target == "edof" else None
+            ),
+            "comparison": str(output_dir / compare_name),
         },
     }
-    (output_dir / "hair_bokeh_metadata.json").write_text(
+    (output_dir / metadata_name).write_text(
         json.dumps(metadata, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
     print(
-        f"[{prefix_name}] 完成：method={args.method}，ROI={x1 - x0}x{y1 - y0}，"
+        f"[{prefix_name}] 完成：target={args.target}，method={args.method}，"
+        f"ROI={x1 - x0}x{y1 - y0}，"
         f"发丝核心={int(core.sum())} 像素，输出={output_dir}"
     )
     return metadata
@@ -445,12 +506,19 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser = argparse.ArgumentParser(
         description=(
-            "在 BOK 图上将细小发丝 mask 区域重建为邻近背景，并用柔和虚化与羽化融合"
-            "避免突兀边界。"
+            "用细发丝 mask 重建邻近背景；BOK 模式匹配散景模糊，"
+            "EDOF 模式保留清晰背景纹理。"
         )
+    )
+    parser.add_argument(
+        "--target",
+        choices=("bok", "edof"),
+        default="bok",
+        help="处理 BOK 散景图，或从 EDOF 清晰图中去除细发丝",
     )
     parser.add_argument("--prefix", help="公共输入前缀，例如 D:\\base\\2p")
     parser.add_argument("--bok", type=Path, help="显式指定 BOK 图像")
+    parser.add_argument("--edof", type=Path, help="显式指定 EDOF 图像")
     parser.add_argument("--mask", type=Path, help="显式指定细发丝 0/1 或 0/255 mask")
     parser.add_argument("--alpha", type=Path, help="可选的细发丝 16-bit alpha")
     parser.add_argument(
@@ -473,21 +541,27 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--mask-threshold", type=float, default=0.5, help="二值 mask 阈值")
     parser.add_argument("--alpha-threshold", type=float, default=0.008, help="alpha 补充支持阈值")
-    parser.add_argument("--expand-radius", type=int, default=2, help="去除抗锯齿发丝边缘的外扩半径")
-    parser.add_argument("--feather-sigma", type=float, default=2.2, help="融合边缘高斯羽化 sigma")
-    parser.add_argument("--inpaint-radius", type=float, default=3.0, help="背景重建邻域半径")
+    parser.add_argument(
+        "--mask-size-policy",
+        choices=("resize", "error"),
+        default="resize",
+        help="mask 与目标图尺寸不同时自动缩放，或直接报错",
+    )
+    parser.add_argument("--expand-radius", type=int, default=None, help="去除抗锯齿发丝边缘的外扩半径")
+    parser.add_argument("--feather-sigma", type=float, default=None, help="融合边缘高斯羽化 sigma")
+    parser.add_argument("--inpaint-radius", type=float, default=None, help="背景重建邻域半径")
     parser.add_argument("--median-kernel", type=int, default=15, help="median/hybrid 的中值核，必须为奇数")
     parser.add_argument(
         "--background-blur-sigma",
         type=float,
-        default=1.6,
-        help="重建背景的轻微高斯虚化 sigma",
+        default=None,
+        help="重建背景的轻微高斯虚化 sigma；EDOF 默认关闭",
     )
     parser.add_argument(
         "--background-blur-strength",
         type=float,
-        default=0.65,
-        help="轻微高斯虚化混合强度",
+        default=None,
+        help="轻微高斯虚化混合强度；EDOF 默认关闭",
     )
     parser.add_argument("--roi-margin", type=int, default=-1, help="ROI 外扩下限；-1 表示自动")
     parser.add_argument("--no-roi", action="store_true", help="关闭 ROI 裁剪，按完整分辨率处理")
@@ -495,11 +569,38 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def apply_target_defaults(args: argparse.Namespace) -> None:
+    """按 BOK/EDOF 目标应用不同默认值，显式命令行参数优先。"""
+
+    defaults = (
+        {
+            "expand_radius": 1,
+            "feather_sigma": 1.0,
+            "inpaint_radius": 3.0,
+            "background_blur_sigma": 0.0,
+            "background_blur_strength": 0.0,
+        }
+        if args.target == "edof"
+        else {
+            "expand_radius": 2,
+            "feather_sigma": 2.2,
+            "inpaint_radius": 3.0,
+            "background_blur_sigma": 1.6,
+            "background_blur_strength": 0.65,
+        }
+    )
+    for name, value in defaults.items():
+        if getattr(args, name) is None:
+            setattr(args, name, value)
+
+
 def validate_arguments(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
     """检查输入模式和数值参数。"""
 
-    if args.prefix is None and args.bok is None:
-        parser.error("必须提供 --prefix 或 --bok")
+    explicit_source = args.edof if args.target == "edof" else args.bok
+    if args.prefix is None and explicit_source is None:
+        option = "--edof" if args.target == "edof" else "--bok"
+        parser.error(f"target={args.target} 时必须提供 --prefix 或 {option}")
     if args.mask is None and args.fine_dir is None:
         parser.error("必须提供 --mask，或通过 --fine-dir 自动发现 mask")
     if args.expand_radius < 0 or args.roi_margin < -1:
@@ -519,6 +620,7 @@ def validate_arguments(args: argparse.Namespace, parser: argparse.ArgumentParser
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
+    apply_target_defaults(args)
     validate_arguments(args, parser)
     try:
         process(args)
