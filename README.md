@@ -73,23 +73,34 @@ fine_hair_score_16bit.png      16-bit 融合置信度
 fine_hair_bok_blend.png        01 mask 与完整 BOK 的红色混合验收图
 fine_hair_overlay.jpg          JPEG 兼容预览
 validation_report.json         尺寸、位深、二值性自动检查
-debug/00_*.jpg、01_*.png...    按 `00_`～`23_` 处理步骤编号的 ROI 尺寸诊断图
+debug/00_*.jpg、01_*.png...    按 `00_`～`27_` 处理步骤编号的 ROI 尺寸诊断图
 ```
 
-算法组合：Sapiens2 Hair 语义邻域 → 排除 Face/Apparel/Clothing 类边界 → BiRefNet alpha 边缘 → BOK 多尺度中值残差 → EDOF/BOK 清晰度负证据 → 双阈值连通 → 只保留约 12 像素 Hair 内侧边缘带 → 形态学宽结构剔除 → 四方向高置信短缺口连接 → 颜色和细长结构约束的有限区域生长。
+算法组合：Sapiens2 Hair 语义邻域 → 按图像分辨率和 Hair 主体尺度生成自适应常规搜索区 → 排除 Face/Apparel/Clothing 类边界 → BiRefNet alpha 边缘 → BOK 多尺度中值残差 → EDOF/BOK 清晰度负证据 → 双阈值连通 → 只保留约 12 像素 Hair 内侧边缘带 → 形态学宽结构剔除 → 四方向高置信短缺口连接 → 颜色和细长结构约束的远距离延伸区生长。
 
-默认参数已经针对 2p 样例调好，优先改善长发丝被截断的问题。`thin-radius` 越大，允许保留的发丝越粗；`gap-close-radius` 控制水平、垂直和两个对角方向可连接的短缺口。区域生长把生长前已确认的发丝作为固定颜色锚点，要求新增像素同时满足 Lab 近似色、局部方向一致、细线响应、搜索范围和 EDOF/BOK 负证据约束，并逐轮抑制宽块形成，不会把新增像素继续当作颜色基准而产生漂移。
+默认使用 `--search-mode adaptive`。常规搜索半径取“4K 参考半径”和“Hair 主体最长边比例”中的较大值并设置分辨率相关上限；远距离延伸半径再由区域生长预设决定。超出常规搜索区后会自动提高颜色、方向一致性、细线、alpha/Hair 证据和虚化负证据门槛，因此不是在整张图上无约束生长。区域生长把生长前已确认的发丝作为固定颜色锚点，不会把新增像素继续当作颜色基准而产生颜色漂移。
 
 区域生长提供四档参数：
 
 ```powershell
---growth-preset off             # 完全关闭，逐像素复现上一版结果
+--growth-preset off             # 完全关闭区域生长
 --growth-preset conservative    # 背景复杂、优先精度
 --growth-preset balanced        # 默认，召回/精度平衡
 --growth-preset recall          # 发丝漏检较多、优先召回
 ```
 
-在 2p 样例上，`balanced` 从生长前的 36,444 像素增加到 42,074（+15.4%）；`recall` 增加到 48,644（+33.5%）。高召回档适合批量结果仍明显漏发丝时使用，但背景中存在与头发同色的细长结构时，应检查 blending 和 `debug/21_region_growth_added.png`。如需细调，可覆盖 `--growth-radius`、`--growth-color-delta`、`--growth-line-min` 和 `--growth-coherence-min` 等高级参数；显式参数优先于预设。
+在固定搜索模式的 2p 样例上，`balanced` 从生长前的 36,444 像素增加到 42,074（+15.4%）；`recall` 增加到 48,644（+33.5%）。2p 没有明显超出旧搜索区的长发丝，因此自适应模式主要用于全量长发数据，不应只依据 2p 像素数判断收益。高召回档应检查 blending、`debug/21_region_growth_added.png` 和 `debug/25_growth_extension_added.png`。
+
+全量数据仍有较长发丝被截断时，推荐先使用：
+
+```powershell
+--growth-preset recall `
+--search-mode adaptive `
+--search-radius-scale 0.24 `
+--search-max-radius 480
+```
+
+背景误检增加时，优先退回 `balanced/conservative`，或降低 `--search-radius-scale`，不要取消搜索区硬上限。`--growth-radius-scale`、`--growth-max-radius`、`--growth-color-delta`、`--growth-line-min` 和 `--growth-coherence-min` 均可逐项覆盖预设。
 
 需要恢复旧版更保守的输出时：
 
@@ -99,6 +110,7 @@ python extract_fine_hair.py `
   --output D:\results\2p-conservative `
   --thin-radius 6 `
   --gap-close-radius 0 `
+  --search-mode fixed `
   --growth-preset off
 ```
 
@@ -153,7 +165,7 @@ python extract_fine_hair.py `
 
 ## ROI 加速
 
-默认根据 Hair mask（缺失时根据 matte）计算外接框，并自动增加 `outer-radius + filter halo`，只在 crop 中运行中值滤波、梯度和形态学操作。最终 01 mask、alpha 和 score 均回填到原始完整分辨率且 ROI 外严格为 0；BOK blending 在 ROI 外保持原始 BOK。可用 `--no-roi` 关闭裁剪；`--roi-margin` 可设置外扩下限，但不会低于保证滤波等价性的安全值。
+默认根据 Hair mask（缺失时根据 matte）计算外接框，并自动增加“有效常规搜索半径 + 有效远距离延伸半径 + filter halo”，只在 crop 中运行中值滤波、梯度和形态学操作。最终 01 mask、alpha 和 score 均回填到原始完整分辨率且 ROI 外严格为 0；BOK blending 在 ROI 外保持原始 BOK。可用 `--no-roi` 关闭裁剪；`--roi-margin` 可设置外扩下限，但不会低于保证滤波等价性的安全值。
 
 ## 将细发丝背景化
 

@@ -20,6 +20,8 @@ HAIR_CLASS_ID = 4
 GROWTH_PRESETS = {
     "off": {
         "growth_radius": 0,
+        "growth_radius_scale": 0.0,
+        "growth_max_radius": 0,
         "growth_color_delta": 18.0,
         "growth_line_min": 0.055,
         "growth_score_min": 0.035,
@@ -32,6 +34,8 @@ GROWTH_PRESETS = {
     },
     "conservative": {
         "growth_radius": 18,
+        "growth_radius_scale": 0.08,
+        "growth_max_radius": 160,
         "growth_color_delta": 13.0,
         "growth_line_min": 0.075,
         "growth_score_min": 0.055,
@@ -44,6 +48,8 @@ GROWTH_PRESETS = {
     },
     "balanced": {
         "growth_radius": 32,
+        "growth_radius_scale": 0.14,
+        "growth_max_radius": 240,
         "growth_color_delta": 18.0,
         "growth_line_min": 0.055,
         "growth_score_min": 0.035,
@@ -56,6 +62,8 @@ GROWTH_PRESETS = {
     },
     "recall": {
         "growth_radius": 48,
+        "growth_radius_scale": 0.22,
+        "growth_max_radius": 360,
         "growth_color_delta": 23.0,
         "growth_line_min": 0.040,
         "growth_score_min": 0.020,
@@ -412,7 +420,8 @@ def grow_thin_connected_region(
 def grow_fine_hair_region(
     bok: np.ndarray,
     seed: np.ndarray,
-    search: np.ndarray,
+    core_search: np.ndarray,
+    growth_search: np.ndarray,
     person_core: np.ndarray,
     coarse_exclusion: np.ndarray,
     nonhair_exclusion: np.ndarray,
@@ -421,17 +430,19 @@ def grow_fine_hair_region(
     score: np.ndarray,
     alpha: np.ndarray,
     semantic: np.ndarray,
+    effective_growth_radius: int,
     args: argparse.Namespace,
 ) -> dict[str, np.ndarray]:
     """按颜色、方向一致性和细长几何约束扩展已确认发丝。"""
 
     zero_bool = np.zeros_like(seed)
     zero_float = np.zeros(seed.shape, np.float32)
-    if args.growth_radius <= 0 or not seed.any():
+    if effective_growth_radius <= 0 or not seed.any():
         return {
             "final": seed.copy(),
             "added": zero_bool,
             "allowed": zero_bool,
+            "extension_allowed": zero_bool,
             "color_similarity": zero_float,
             "coherence": zero_float,
             "confidence": zero_float,
@@ -450,7 +461,7 @@ def grow_fine_hair_region(
     # 才允许短距离跨过 Face/Apparel 等语义区域，以恢复贴脸或压在衣服上的发丝。
     hard_region = person_core | nonhair_exclusion
     hard_override = (
-        (distance <= min(float(args.growth_radius), 8.0))
+        (distance <= min(float(effective_growth_radius), 8.0))
         & (color_delta <= min(args.growth_color_delta, 12.0))
         & (line >= max(args.growth_line_min, 0.12))
         & (coherence >= max(args.growth_coherence_min, 0.35))
@@ -473,19 +484,36 @@ def grow_fine_hair_region(
             | strong_geometry
         )
     )
-    allowed = (
-        search
+    common_allowed = (
+        growth_search
         & ~coarse_exclusion
-        & (distance <= float(args.growth_radius))
+        & (distance <= float(effective_growth_radius))
         & (color_delta <= args.growth_color_delta)
         & evidence
         & (~hard_region | hard_override)
     )
 
+    # 超出常规搜索区后提高门槛，只允许颜色更接近、方向更稳定且仍有
+    # alpha/Hair 证据的连续细线进入远距离延伸走廊。
+    extension_evidence = (
+        ~core_search
+        & (color_delta <= args.growth_color_delta * 0.72)
+        & (line >= max(args.growth_line_min * 1.25, 0.065))
+        & (coherence >= min(args.growth_coherence_min + 0.10, 0.95))
+        & (blur_loss <= args.growth_blur_max * 0.90)
+        & (
+            (alpha >= max(args.growth_alpha_min * 2.0, 0.002))
+            | (semantic >= 0.12)
+        )
+        & ~hard_region
+    )
+    extension_allowed = common_allowed & extension_evidence
+    allowed = common_allowed & (core_search | extension_evidence)
+
     grown = grow_thin_connected_region(
         seed,
         allowed,
-        args.growth_radius,
+        effective_growth_radius,
         args.growth_width_radius,
         args.growth_max_neighbors,
     )
@@ -503,7 +531,7 @@ def grow_fine_hair_region(
         1.0,
     )
     distance_confidence = np.clip(
-        1.0 - distance / max(float(args.growth_radius), 1.0),
+        1.0 - distance / max(float(effective_growth_radius), 1.0),
         0.0,
         1.0,
     )
@@ -524,6 +552,7 @@ def grow_fine_hair_region(
         "final": grown,
         "added": added,
         "allowed": allowed,
+        "extension_allowed": extension_allowed,
         "color_similarity": color_similarity,
         "coherence": coherence,
         "confidence": confidence,
@@ -557,6 +586,67 @@ def clean_hair_seed(seed: np.ndarray, requested_min_area: int) -> tuple[np.ndarr
     if not clean.any() and largest_id != 0:
         clean[labels == largest_id] = True
     return clean, effective_min_area
+
+
+def estimate_hair_extent(seed: np.ndarray) -> float:
+    """估计主要 Hair 连通域尺度，避免人物间距或零散误检放大搜索半径。"""
+
+    if not seed.any():
+        return 0.0
+    count, _, stats, _ = cv2.connectedComponentsWithStats(
+        seed.astype(np.uint8),
+        connectivity=8,
+    )
+    minimum_area = max(16, int(round(seed.size / REFERENCE_AREA * 100.0)))
+    extents = [
+        float(max(stats[index, cv2.CC_STAT_WIDTH], stats[index, cv2.CC_STAT_HEIGHT]))
+        for index in range(1, count)
+        if stats[index, cv2.CC_STAT_AREA] >= minimum_area
+    ]
+    return max(extents, default=0.0)
+
+
+def effective_search_radii(
+    hair_seed: np.ndarray,
+    args: argparse.Namespace,
+    use_hair_scale: bool,
+) -> tuple[int, int, float, float]:
+    """按分辨率与主要 Hair 尺度计算常规搜索半径和远距离生长半径。"""
+
+    resolution_scale = float(np.sqrt(hair_seed.size / REFERENCE_AREA))
+    if args.search_mode == "fixed":
+        return (
+            args.outer_radius,
+            args.growth_radius,
+            estimate_hair_extent(hair_seed) if use_hair_scale else 0.0,
+            resolution_scale,
+        )
+
+    hair_extent = estimate_hair_extent(hair_seed) if use_hair_scale else 0.0
+    outer_minimum = int(round(args.outer_radius * resolution_scale))
+    outer_from_hair = int(round(hair_extent * args.search_radius_scale))
+    outer_cap = (
+        args.search_max_radius
+        if args.search_max_radius > 0
+        else int(round(320 * resolution_scale))
+    )
+    effective_outer = min(max(outer_minimum, outer_from_hair), max(outer_cap, 0))
+
+    if args.growth_radius <= 0:
+        effective_growth = 0
+    else:
+        growth_minimum = int(round(args.growth_radius * resolution_scale))
+        growth_from_hair = int(round(hair_extent * args.growth_radius_scale))
+        growth_cap = (
+            int(round(args.growth_max_radius * resolution_scale))
+            if args.growth_max_radius > 0
+            else 0
+        )
+        effective_growth = min(
+            max(growth_minimum, growth_from_hair),
+            max(growth_cap, 0),
+        )
+    return effective_outer, effective_growth, hair_extent, resolution_scale
 
 
 def compute_roi(
@@ -759,6 +849,8 @@ def run_algorithm(
     semantic_probability: np.ndarray,
     labels: np.ndarray | None,
     hair_seed: np.ndarray,
+    effective_outer_radius: int,
+    effective_growth_radius: int,
     args: argparse.Namespace,
 ) -> dict[str, np.ndarray]:
     """在已经裁剪的 ROI 内执行细碎边缘发丝检测。"""
@@ -768,7 +860,10 @@ def run_algorithm(
         cv2.DIST_L2,
         5,
     )
-    search = distance_to_support <= float(args.outer_radius)
+    search = distance_to_support <= float(effective_outer_radius)
+    growth_search = distance_to_support <= float(
+        effective_outer_radius + effective_growth_radius
+    )
 
     # 只保留人像与头发主体边缘，不允许大片不透明内部进入最终结果。
     person_core = cv2.erode(
@@ -790,6 +885,12 @@ def run_algorithm(
     fringe_zone = search & ~person_core & ~coarse_exclusion & ~nonhair_exclusion
 
     line = median_line_response(bok, search)
+    # 自适应模式额外计算延伸区响应；固定模式沿用旧行为，便于严格回归。
+    growth_line = (
+        median_line_response(bok, growth_search)
+        if args.search_mode == "adaptive" and effective_growth_radius > 0
+        else line
+    )
     blur_loss = blur_loss_map(bok, edof)
     semantic = cv2.dilate(semantic_probability, ellipse(18))
     alpha_edge = cv2.morphologyEx(alpha, cv2.MORPH_GRADIENT, ellipse(2))
@@ -855,7 +956,7 @@ def run_algorithm(
         final,
         before_thin,
         score,
-        line,
+        growth_line,
         alpha,
         blur_loss,
         args.gap_close_radius,
@@ -870,6 +971,7 @@ def run_algorithm(
         bok,
         pre_growth,
         search,
+        growth_search,
         person_core,
         coarse_exclusion,
         nonhair_exclusion,
@@ -878,6 +980,7 @@ def run_algorithm(
         score,
         alpha,
         semantic,
+        effective_growth_radius,
         args,
     )
     final = growth["final"]
@@ -889,11 +992,13 @@ def run_algorithm(
     final_score = np.maximum(score, growth["confidence"])
     return {
         "search": search,
+        "growth_search": growth_search,
         "person_core": person_core,
         "coarse_exclusion": coarse_exclusion,
         "nonhair_exclusion": nonhair_exclusion,
         "fringe_zone": fringe_zone,
         "line": line,
+        "growth_line": growth_line,
         "blur_loss": blur_loss,
         "alpha_edge": alpha_edge,
         "score": score,
@@ -905,6 +1010,8 @@ def run_algorithm(
         "gap_bridge": gap_bridge,
         "pre_growth": pre_growth,
         "growth_allowed": growth["allowed"],
+        "growth_extension_allowed": growth["extension_allowed"],
+        "growth_extension_added": growth["added"] & ~search,
         "growth_color_similarity": growth["color_similarity"],
         "growth_coherence": growth["coherence"],
         "growth_added": growth["added"],
@@ -977,6 +1084,19 @@ def save_debug(
         stages["growth_confidence"],
     )
     save_binary_visual(debug_dir / "23_final_mask_visual.png", stages["final"])
+    save_binary_visual(
+        debug_dir / "24_growth_search_region.png",
+        stages["growth_search"],
+    )
+    save_binary_visual(
+        debug_dir / "25_growth_extension_added.png",
+        stages["growth_extension_added"],
+    )
+    save_binary_visual(
+        debug_dir / "26_growth_extension_allowed.png",
+        stages["growth_extension_allowed"],
+    )
+    save_u8(debug_dir / "27_growth_line_response.png", stages["growth_line"])
 
 
 def process_one(
@@ -1061,6 +1181,18 @@ def process_one(
     if not hair_seed_full.any() and args.empty_policy == "error":
         raise ValueError(f"[{sample.prefix}] 无法得到有效种子")
 
+    use_hair_scale = not semantic_seed_source.startswith("matte_fallback")
+    (
+        effective_outer_radius,
+        effective_growth_radius,
+        estimated_hair_extent,
+        resolution_scale,
+    ) = effective_search_radii(hair_seed_full, args, use_hair_scale)
+    print(
+        f"[{sample.prefix}] 搜索半径：常规={effective_outer_radius}px，"
+        f"远距离延伸={effective_growth_radius}px，模式={args.search_mode}"
+    )
+
     filter_halo = max(
         24,
         max(MEDIAN_KERNELS) // 2 + 6,
@@ -1069,7 +1201,9 @@ def process_one(
         args.gap_close_radius * 2 + 4,
         args.growth_width_radius + 8,
     )
-    safe_roi_margin = args.outer_radius + filter_halo
+    safe_roi_margin = (
+        effective_outer_radius + effective_growth_radius + filter_halo
+    )
     if 0 <= args.roi_margin < safe_roi_margin:
         print(
             f"[{sample.prefix}] 警告：--roi-margin={args.roi_margin} 小于安全值 "
@@ -1118,6 +1252,8 @@ def process_one(
             semantic_probability_roi,
             labels_roi,
             hair_seed_roi,
+            effective_outer_radius,
+            effective_growth_radius,
             args,
         )
         empty_reason = None
@@ -1129,11 +1265,13 @@ def process_one(
         zero_float = np.zeros(alpha_roi.shape, np.float32)
         stages = {
             "search": zero_bool,
+            "growth_search": zero_bool,
             "person_core": zero_bool,
             "coarse_exclusion": zero_bool,
             "nonhair_exclusion": zero_bool,
             "fringe_zone": zero_bool,
             "line": zero_float,
+            "growth_line": zero_float,
             "blur_loss": zero_float,
             "alpha_edge": zero_float,
             "score": zero_float,
@@ -1145,6 +1283,8 @@ def process_one(
             "gap_bridge": zero_bool,
             "pre_growth": zero_bool,
             "growth_allowed": zero_bool,
+            "growth_extension_allowed": zero_bool,
+            "growth_extension_added": zero_bool,
             "growth_color_similarity": zero_float,
             "growth_coherence": zero_float,
             "growth_added": zero_bool,
@@ -1193,7 +1333,7 @@ def process_one(
             "BiRefNet alpha 边缘 + Sapiens2 Hair 软先验 + "
             "多尺度中值细线响应 + EDOF/BOK 虚化负证据 + "
             "受证据约束的四方向短缺口连接 + "
-            "颜色锚定与细长结构约束的有限区域生长"
+            "自适应双层搜索区 + 颜色锚定与细长结构约束的远距离区域生长"
         ),
         "inputs": sample_paths_to_json(sample),
         "fallback": {
@@ -1214,6 +1354,12 @@ def process_one(
         },
         "parameters": {
             "outer_radius": args.outer_radius,
+            "search_mode": args.search_mode,
+            "search_radius_scale": args.search_radius_scale,
+            "search_max_radius": args.search_max_radius,
+            "effective_outer_radius": effective_outer_radius,
+            "estimated_hair_extent": estimated_hair_extent,
+            "resolution_scale": resolution_scale,
             "inner_band": args.inner_band,
             "nonhair_radius": args.nonhair_radius,
             "thin_radius": args.thin_radius,
@@ -1224,6 +1370,9 @@ def process_one(
             "gap_blur_max": args.gap_blur_max,
             "growth_preset": args.growth_preset,
             "growth_radius": args.growth_radius,
+            "growth_radius_scale": args.growth_radius_scale,
+            "growth_max_radius": args.growth_max_radius,
+            "effective_growth_radius": effective_growth_radius,
             "growth_color_delta": args.growth_color_delta,
             "growth_line_min": args.growth_line_min,
             "growth_score_min": args.growth_score_min,
@@ -1254,6 +1403,9 @@ def process_one(
             "directional_gap_bridge": int(stages["gap_bridge"].sum()),
             "pre_growth": int(stages["pre_growth"].sum()),
             "region_growth_added": int(stages["growth_added"].sum()),
+            "growth_extension_added": int(
+                stages["growth_extension_added"].sum()
+            ),
             "final": int(full_final.sum()),
         },
         "outputs": {
@@ -1320,11 +1472,13 @@ def validate_arguments(args: argparse.Namespace, parser: argparse.ArgumentParser
         parser.error("--batch 必须同时指定 --input-dir")
     radii = (
         args.outer_radius,
+        args.search_max_radius,
         args.inner_band,
         args.nonhair_radius,
         args.thin_radius,
         args.gap_close_radius,
         args.growth_radius,
+        args.growth_max_radius,
         args.growth_width_radius,
     )
     if any(radius < 0 for radius in radii):
@@ -1337,6 +1491,8 @@ def validate_arguments(args: argparse.Namespace, parser: argparse.ArgumentParser
         parser.error("--low-score 不能大于 --high-score")
     if args.growth_color_delta <= 0.0:
         parser.error("--growth-color-delta 必须大于 0")
+    if args.search_radius_scale < 0.0 or args.growth_radius_scale < 0.0:
+        parser.error("搜索和生长的 radius-scale 必须大于或等于 0")
     if not 1 <= args.growth_max_neighbors <= 8:
         parser.error("--growth-max-neighbors 必须位于 1～8")
     for name in (
@@ -1421,7 +1577,30 @@ def build_parser() -> argparse.ArgumentParser:
         help="输出目录；批处理时每个 prefix 建立独立子目录",
     )
 
-    parser.add_argument("--outer-radius", type=int, default=120, help="Hair 种子向外搜索半径")
+    parser.add_argument(
+        "--outer-radius",
+        type=int,
+        default=120,
+        help="4K 参考尺度下常规 Hair 搜索半径；adaptive 模式把它作为下限",
+    )
+    parser.add_argument(
+        "--search-mode",
+        choices=("adaptive", "fixed"),
+        default="adaptive",
+        help="按分辨率/Hair 尺度自适应搜索（默认），或保持固定像素半径",
+    )
+    parser.add_argument(
+        "--search-radius-scale",
+        type=float,
+        default=0.18,
+        help="常规搜索半径相对主要 Hair 连通域最长边的比例",
+    )
+    parser.add_argument(
+        "--search-max-radius",
+        type=int,
+        default=0,
+        help="自适应常规搜索半径上限；0 表示按分辨率自动计算",
+    )
     parser.add_argument("--inner-band", type=int, default=12, help="允许保留的 Hair 内侧边缘宽度")
     parser.add_argument("--nonhair-radius", type=int, default=3, help="非 Hair 人体类别排除半径")
     parser.add_argument("--thin-radius", type=int, default=8, help="删除宽边界结构的开运算半径")
@@ -1469,6 +1648,18 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="从已确认细发丝向外生长的最大像素距离",
+    )
+    parser.add_argument(
+        "--growth-radius-scale",
+        type=float,
+        default=None,
+        help="远距离延伸半径相对主要 Hair 连通域最长边的比例",
+    )
+    parser.add_argument(
+        "--growth-max-radius",
+        type=int,
+        default=None,
+        help="4K 参考尺度下远距离延伸半径上限",
     )
     parser.add_argument(
         "--growth-color-delta",
